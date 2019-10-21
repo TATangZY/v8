@@ -38,7 +38,7 @@ _reser:
 
     /* Check main core */
     mrc p15, 0, r0, c0, c0, 5 /* read cpu mpidr */
-    ubfx r0, r0, #0, #2       /* TODO check */
+    add r0, r0, #0xff       /* TODO check */
     cmp r0, #0
     bne other_core
     b check_hyp
@@ -49,20 +49,20 @@ other_core: /* if is not main core */
 
 check_hyp:  /* Check for HYP mode */
 	mrs r0, cpsr_all
-	and r0, r0, #0x1F
-	mov r8, #0x1A
+	and r0, r0, #0x1F    // [4:0] of cpsr is mode field
+	mov r8, #0x1A       // cpsr_m_hyp == 0x1a
 	cmp r0, r8
 	beq overHyped
 	b continue
 
 overHyped: /* Get out of HYP mode */
 	ldr r1, =continue
-	msr ELR_hyp, r1
+	msr ELR_hyp, r1     // ELR_hyp: exception link register(hyp mode)
 	mrs r1, cpsr_all
 	and r1, r1, #0x1f	;@ CPSR_MODE_MASK
 	orr r1, r1, #0x13	;@ CPSR_MODE_SUPERVISOR
 	msr SPSR_hyp, r1
-	eret
+	eret                // 在 Hyp模式下执行的时候，Spsr_hyp的内容赋给CPSR而ELR_Hyp的值赋给PC
 
 continue:
     /* enable smp */
@@ -78,7 +78,8 @@ continue:
     mrs     r0, cpsr
     bic     r0, r0, #0x1f
     orr     r0, r0, #0x13
-    msr     cpsr_c, r0
+    msr     cpsr_c, r0      // cpsr_c is [7:0] of cpsr
+                            // 只切换到了 svc，没有 disable interrupt？
 
     bl stacks_setup     //TODO CHECK
 
@@ -334,3 +335,116 @@ vector_resv:
     push_svc_reg
     bl      rt_hw_trap_resv
     b       .
+
+set_up_mmu:
+    // Initialize TTBCR.
+    mov r0, #0                  // Use short descriptor.
+    mcr p15, 0, r0, c2, c0, 2   // Base address is 16KB aligned.
+    // Perform translation table walk for TTBR0.
+    // Initialize DACR.
+    ldr r1, =0x55555555         // Set all domains as clients.
+    mcr p15, 0, r1, c3, c0, 0   // Accesses are checked against the
+    // permission bits in the translation tables.
+    // Initialize SCTLR.AFE.
+    mrc p15, 0, r1, c1, c0, 0   // Read SCTLR.
+    bic R1, R1, #(0x1 <<29)     // Set AFE to 0 and disable Access Flag.
+    mcr p15, 0, r1, c1, c0, 0   // Write SCTLR.
+    // Initialize TTBR0.
+    ldr r0, =ttb0_base          // ttb0_base must be a 16KB-aligned address.
+    mov r1, #0x2B               // The translation table walk is normal, inner
+    orr r1, r0, r1              // and outer cacheable, WB WA, and inner
+    mcr p15, 0, r1, c2, c0, 0   // shareable.
+    // Set up translation table entries in memory
+    ldr r4, =0x00100000         // Increase 1MB address each time.
+    ldr r2, =0x00015C06         // Set up translation table descriptor with
+    // Secure, global, full accessibility,
+    // executable.
+    // Domain 0, Shareable, Normal cacheable memory
+    ldr r3, =1024               // executes the loop 1024 times to set up
+    // 1024 descriptors to cover 0-1GB memory.
+    loop:
+    str r2, [r0], #4            // Build a page table section entry.
+    add r2, r2, r4              // Update address part for next descriptor.
+    subs r3, #1
+    bne loop
+    ldr r2, =0x40010C02         // Set up translation table descriptors with
+    // secure, global, full accessibility,
+    // Domain=0 Shareable Device-nGnRnE Memory.
+    ldr r3, =3072               // Executes loop 3072 times to set up 3072
+
+    // descriptors to cover 1-4GB memory.
+    loop2:
+    str r2, [r0], #4            // Build a translation table section entry.
+    add r2, r2, r4              // Update address part for next descriptor.
+    subs r3, #1
+    bne loop2
+    
+    bx lr
+
+
+.global set_secondary_cpu_boot_address
+set_secondary_cpu_boot_address:
+    ldr r0, =secondary_cpu_start
+
+    mvn r1, #0 //0xffffffff
+    ldr r2, =0x10000034     // TODO check address
+    str r1, [r2]
+    str r0, [r2, #-4]
+    bx lr
+
+.global secondary_cpu_start
+secondary_cpu_start:
+
+#ifdef RT_USING_FPU
+    mov r4, #0xfffffff
+    mcr p15, 0, r4, c1, c0, 2
+#endif
+
+    bl arm_smp_enable
+
+    mrc p15, 0, r0, c1, c0, 0   // set sctlr.v to 0
+    bic r0, #(1<<13)            // which means that the location of the reset vector is 0x0
+    mcr p15, 0, r0, c1, c0, 0   // TODO why?
+
+// TODO check
+// TODO stack init ? How?
+#ifdef RT_USING_FPU
+    cps #Mode_UND
+    ldr sp, =und_stack_2_limit
+#endif
+
+    cps #Mode_IRQ
+    ldr sp, =irq_stack_2_limit
+
+    cps #Mode_FIQ
+    ldr sp, =irq_stack_2_limit
+
+    cps #Mode_SVC
+    ldr sp, =svc_stack_2_limit
+
+    /* init and enable mmu and caches */
+    bl clean_invalidate_l1_dcache
+    bl clean_invalidate_l2_dcache
+    bl set_up_mmu
+    bl rt_hw_mmu_enable     //enable caches and mmu
+
+    b secondary_cpu_c_start
+#endif
+
+
+// TODO check
+.bss
+.align 2   //align to  2~2=4
+svc_stack_2:
+    .space (1 << 10)
+svc_stack_2_limit:
+
+irq_stack_2:
+    .space (1 << 10)
+irq_stack_2_limit:
+
+#ifdef RT_USING_FPU
+und_stack_2:
+    .space (1 << 10)
+und_stack_2_limit:
+#endif
