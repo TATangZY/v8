@@ -1,5 +1,3 @@
-//TODO check
-
 #ifndef DRV_UART_H__
 #define DRV_UART_H__
 
